@@ -1,0 +1,294 @@
+---
+title: "Comment-Response Match Review"
+execute:
+  echo: false
+  warning: false
+jupyter: stats
+---
+
+
+```{python}
+from pathlib import Path
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from ast import literal_eval
+
+from regcomment_influence import config
+
+sample_dir = Path(config.data_dir)/'processed'/'response_linking'
+review_dir = Path(config.data_dir)/'raw_data'/'response_linking'/'match_review'
+
+sbert_scores = [f'{m}_score' for m in ['all-mpnet-base-v2',
+                                        'all-distilroberta-v1',
+                                        'multi-qa-mpnet-base-dot-v1',
+                                        'all-MiniLM-L12-v2']]
+
+# Re-format GPT4 data for sample 3 to make it consistent with others
+sample_3_gpt4_df = pd.read_csv(review_dir/'comment_response_match_review_03_GPT4.csv')
+sample_3_gpt4_df['match_quality'] = sample_3_gpt4_df['gpt_answer'].str.slice(0,1).astype(int)
+sample_3_gpt4_df.loc[:39].to_csv(review_dir/'comment_response_match_review_03a_GPT4.csv')
+sample_3_gpt4_df.loc[40:].to_csv(review_dir/'comment_response_match_review_03b_GPT4.csv')
+
+
+scored = []
+reviewed = []
+for sample in [2,3]:
+
+    nama_df = pd.read_csv(sample_dir/'nama_full_sample'/f'nama_scores_sample_{sample:02}.csv')
+    sbert_df = pd.read_csv(sample_dir/f'sbert_scored_response_comment_pairs_sample_{sample:02}.csv')
+    
+    nama_sbert_df = pd.read_csv(sample_dir/'nama_sbert'/f'nama_scores_sample_{sample:02}.csv')
+    nama_sbert_df = nama_sbert_df[['response_text','comment_text']
+                                    +[c for c in nama_sbert_df.columns if c.startswith('nama_sbert_')]]
+
+    # if sample == 2:
+    # Need to get text associated with paragraph ids in order to merge bm25 scores with other data
+    base_sample_df = (pd.read_csv(sample_dir/f'nama_scored_response_comment_pairs_sample_{sample:02}.csv')
+                        [['frdoc_number','response_id','comment_id','comment_paragraphs','comment_text','response_text']]
+                        .assign(comment_paragraphs=lambda df: 
+                                df['comment_paragraphs'].apply(
+                                    lambda x: str(list(literal_eval(x)))
+                                    ))
+                        .merge(nama_df[['comment_text','response_text']]))
+
+    bm25_df = (pd.read_csv(sample_dir/f'bm25_scored_response_comment_pairs_sample_{sample:02}.csv')
+                .rename(columns={'bm25_score_unnorm':'bm25_score','bm25_score_norm':'bm25norm_score'})
+                [['frdoc_number','response_id','comment_id','comment_paragraphs','bm25_score','bm25norm_score']]
+                .merge(base_sample_df,'right',on=['frdoc_number','response_id','comment_id','comment_paragraphs'])
+                .drop(['frdoc_number','response_id','comment_id','comment_paragraphs'],axis=1))
+
+
+    sample_reviewed = []
+    for split in ['a','b']:
+        sample_df = pd.read_csv(sample_dir/f'comment_response_match_review_{sample:02}{split}.csv')
+
+        for f in review_dir.glob(f'comment_response_match_review_{sample:02}{split}_*.csv'):
+            try:
+                df = (pd.read_csv(review_dir/f)
+                        .rename(columns={'llama-2':'match_quality'}))
+            except:
+                print(f'Failed to load {f}')
+                continue
+
+            try:
+                for c in ['frdoc_number','comment_id']:
+                    assert (sample_df[c] == df[c]).all()
+            except:
+                print(f'Failed to merge {f}')
+                continue
+
+            df = (sample_df
+                    .copy()
+                    .rename(columns={'rule_text':'response_text'})
+                    .assign(
+                        match_quality=df['match_quality'],
+                        sample=sample,
+                        ra=str(f).split('_')[-1].split('.')[0]))
+
+            sample_reviewed.append(df)
+
+    sample_reviewed_df = pd.concat(sample_reviewed)
+    
+    reviewed.append(sample_reviewed_df)
+
+    mean_ra_scores_df = (sample_reviewed_df
+                            .query('(ra != "GPT4") & (ra != "Llama2")')
+                            .groupby(['comment_text','response_text'])[['match_quality']].mean()
+                            .reset_index()
+                            .rename(columns={'match_quality':'ra_score'}))
+
+    gpt4_scores_df = (sample_reviewed_df
+                            .query('ra == "GPT4"')
+                            .groupby(['comment_text','response_text'])[['match_quality']].mean()
+                            .reset_index()
+                            .rename(columns={'match_quality':'gpt4_score'}))
+
+    llama2_scores_df = (sample_reviewed_df
+                        .query('ra == "Llama2"')
+                        .groupby(['comment_text','response_text'])[['match_quality']].mean()
+                        .reset_index()
+                        .rename(columns={'match_quality':'llama2_score'}))
+
+    scored.append(mean_ra_scores_df
+                    .merge(bm25_df,'left',on=['response_text','comment_text'])
+                    .merge(nama_df,'left',on=['response_text','comment_text'])
+                    .merge(sbert_df,'left',on=['response_text','comment_text'])
+                    .merge(nama_sbert_df,'left',on=['response_text','comment_text'])
+                    .merge(gpt4_scores_df,'left',on=['response_text','comment_text'])
+                    .merge(llama2_scores_df,'left',on=['response_text','comment_text'])
+                    )
+
+scored_df = pd.concat(scored)
+
+reviewed_df = pd.concat(reviewed)
+
+scored_df.describe().T
+```
+
+
+## Human Responses
+
+### RA score correlation matrix
+
+```{python}
+df = (reviewed_df
+        .query('ra != "GPT4"')
+        .set_index(['comment_text','response_text','sample','ra'])
+        .unstack(level=3)
+        .corr()
+        .round(2)
+        .fillna('')
+        .replace({1.0:''})
+        )
+
+df.columns = df.columns.droplevel(0)
+df.index = df.index.droplevel(0)
+
+ra_order = ['Barbie','Niko','Taylor','Yuka','Rebekah','Dillon','Marie']
+df.loc[ra_order,ra_order]
+
+```
+
+
+## Automated Scoring
+
+### GPT-4
+
+```{python}
+ax = (scored_df
+        .dropna()
+        .assign(s=5)
+        .groupby(['ra_score','gpt4_score'])[['s']].sum()
+        .reset_index()
+        .plot.scatter('ra_score','gpt4_score',s='s'))
+
+ax.set_xlabel('Mean RA score')
+ax.set_ylabel('GPT4 score')
+plt.show()
+```
+
+
+### BM25
+
+```{python}
+ax = (scored_df
+        .dropna()
+        .assign(s=5)
+        .groupby(['ra_score','bm25_score'])[['s']].sum()
+        .reset_index()
+        .plot.scatter('ra_score','bm25_score',s='s'))
+
+ax.set_xlabel('Mean RA score')
+ax.set_ylabel('BM25 score')
+plt.show()
+```
+
+### Normalized BM25
+
+```{python}
+ax = (scored_df
+        .dropna()
+        .assign(s=5)
+        .groupby(['ra_score','bm25norm_score'])[['s']].sum()
+        .reset_index()
+        .plot.scatter('ra_score','bm25norm_score',s='s'))
+
+ax.set_xlabel('Mean RA score')
+ax.set_ylabel('BM25 (normalized) score')
+plt.show()
+```
+
+
+### RoBERTa Embedding Cosine Similarity
+
+```{python}
+ax = (scored_df
+        .dropna()
+        .assign(s=5)
+        .groupby(['ra_score','nama_score_0'])[['s']].sum()
+        .reset_index()
+        .plot.scatter('ra_score','nama_score_0',s='s'))
+
+ax.set_xlabel('Mean RA score')
+ax.set_ylabel('RoBERTa cosine similarity')
+plt.show()
+```
+
+
+
+### Sentence Transformer Embedding Cosine Similarity
+
+```{python}
+
+ax = (scored_df
+        .dropna()
+        .assign(s=5)
+        .groupby(['ra_score','multi-qa-mpnet-base-dot-v1_score'])[['s']].sum()
+        .reset_index()
+        .plot.scatter('ra_score','multi-qa-mpnet-base-dot-v1_score',s='s'))
+
+ax.set_xlabel('Mean RA score')
+ax.set_ylabel('Sentence Transformer cosine similarity')
+plt.show()
+```
+
+
+
+
+### Nama Embedding Similarity Score
+
+```{python}
+i = 8
+ax = (scored_df
+        .dropna()
+        .assign(s=5)
+        .groupby(['ra_score',f'nama_score_{i}'])[['s']].sum()
+        .reset_index()
+        .plot.scatter('ra_score',f'nama_score_{i}',s='s'))
+
+ax.set_xlabel('Mean RA score')
+ax.set_ylabel('Nama similarity score')
+plt.show()
+```
+
+
+
+### Nama SBERT Similarity Score
+
+```{python}
+
+score = 'nama_score_0'
+
+ax = (scored_df
+        .dropna()
+        .assign(s=5)
+        .groupby(['ra_score',score])[['s']].sum()
+        .reset_index()
+        .plot.scatter('ra_score',score,s='s'))
+
+ax.set_xlabel('Mean RA score')
+ax.set_ylabel('Sentence Transformer cosine similarity')
+plt.show()
+```
+
+
+
+
+
+### Cross-score correlations
+
+```{python}
+
+nama_scores = [f'nama_score_{i}' for i in range(11)]
+nama_sbert_scores = [f'nama_sbert_score_{i}' for i in range(6)]
+all_scores = ['ra_score','gpt4_score','llama2_score','bm25_score','bm25norm_score'] + sbert_scores + nama_scores + nama_sbert_scores
+
+(scored_df[all_scores]
+    .assign(mix_score = lambda df: df[['multi-qa-mpnet-base-dot-v1_score','nama_score_5']].mean(axis=1))
+    .corr()
+    .round(2)
+    .replace({1.0:''}))
+```
+
+
